@@ -150,25 +150,37 @@ async function handleDoxyme(params) {
 }
 
 module.exports = async (req, res) => {
+  // Handle GET (health check)
+  if (req.method === "GET") {
+    return res.status(200).json({ ok: true, app: "doxyme-slack-calling" });
+  }
+
   // Collect raw body
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks).toString("utf8");
 
-  // Verify signature
-  if (!verifySlackSignature(req, rawBody)) {
-    return res.status(401).json({ error: "Invalid signature" });
-  }
-
   const contentType = req.headers["content-type"] || "";
 
-  // Handle JSON payloads (URL verification, events)
+  // Handle JSON payloads (URL verification) — must respond before signature check
   if (contentType.includes("application/json")) {
-    const body = JSON.parse(rawBody);
-    if (body.type === "url_verification") {
-      return res.status(200).json({ challenge: body.challenge });
+    try {
+      const body = JSON.parse(rawBody);
+      if (body.type === "url_verification") {
+        return res.status(200).json({ challenge: body.challenge });
+      }
+    } catch (_) {}
+
+    // For other JSON payloads, verify signature
+    if (!verifySlackSignature(req, rawBody)) {
+      return res.status(401).json({ error: "Invalid signature" });
     }
     return res.status(200).json({ ok: true });
+  }
+
+  // Verify signature for form-encoded payloads (slash commands)
+  if (!verifySlackSignature(req, rawBody)) {
+    return res.status(401).json({ error: "Invalid signature" });
   }
 
   // Handle form-encoded payloads (slash commands)
