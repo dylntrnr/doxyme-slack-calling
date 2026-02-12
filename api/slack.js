@@ -9,14 +9,10 @@ function verifySlackSignature(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
   const slackSig = req.headers["x-slack-signature"];
   if (!timestamp || !slackSig) return false;
-
-  // Reject requests older than 5 minutes
   if (Math.abs(Date.now() / 1000 - timestamp) > 300) return false;
-
   const baseString = `v0:${timestamp}:${rawBody}`;
   const hmac = crypto.createHmac("sha256", SIGNING_SECRET).update(baseString).digest("hex");
   const computed = `v0=${hmac}`;
-
   return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(slackSig));
 }
 
@@ -39,57 +35,63 @@ async function slackAPI(method, body) {
   return res.json();
 }
 
-async function handleDoxySetup(params) {
-  const url = normalizeDoxyUrl(params.text);
-  if (!url) {
+// /doxyme setup <url> — save room
+// /doxyme @user — DM them your link
+// /doxyme — post join button in channel
+async function handleDoxyme(params) {
+  const callerId = params.user_id;
+  const text = (params.text || "").trim();
+
+  // Setup mode: /doxyme setup https://doxy.me/room
+  if (text.toLowerCase().startsWith("setup ")) {
+    const urlPart = text.slice(6).trim();
+    const url = normalizeDoxyUrl(urlPart);
+    if (!url) {
+      return {
+        response_type: "ephemeral",
+        text: "Invalid URL. Usage: `/doxyme setup https://doxy.me/yourroom`"
+      };
+    }
+    await setUser(callerId, url);
     return {
       response_type: "ephemeral",
-      text: "Please provide a valid Doxy.me room URL.\nUsage: `/doxy-setup https://doxy.me/yourroom`"
+      text: `✅ Room linked: ${url}\nNow use \`/doxyme @someone\` to invite, or \`/doxyme\` to post in channel.`
     };
   }
 
-  await setUser(params.user_id, url);
-  return {
-    response_type: "ephemeral",
-    text: `✅ Your Doxy.me room has been linked: ${url}\nUse \`/doxyme @someone\` to invite people to your room.`
-  };
-}
-
-async function handleDoxyme(params) {
-  const callerId = params.user_id;
+  // Everything else needs a saved room
   const userRecord = await getUser(callerId);
-
   if (!userRecord || !userRecord.doxyUrl) {
     return {
       response_type: "ephemeral",
-      text: "You haven't set up your Doxy.me room yet.\nRun `/doxy-setup https://doxy.me/yourroom` first."
+      text: "Set up your room first: `/doxyme setup https://doxy.me/yourroom`"
     };
   }
 
   const doxyUrl = userRecord.doxyUrl;
 
-  // Extract mentioned user IDs: <@U12345> or <@U12345|name>
+  // Extract @mentions
   const mentionRegex = /<@(U[A-Z0-9]+)(?:\|[^>]*)?>/g;
   const mentionedUsers = [];
   let match;
-  while ((match = mentionRegex.exec(params.text || "")) !== null) {
+  while ((match = mentionRegex.exec(text)) !== null) {
     mentionedUsers.push(match[1]);
   }
 
-  // No users mentioned — post join button in channel
+  // No mentions — post join button in channel
   if (mentionedUsers.length === 0) {
     return {
       response_type: "in_channel",
       blocks: [
         {
           type: "section",
-          text: { type: "mrkdwn", text: `📹 *<@${callerId}> is starting a Doxy.me call*` }
+          text: { type: "mrkdwn", text: `📹 *<@${callerId}> is starting a Doxy.me call*\n${doxyUrl}` }
         },
         {
           type: "actions",
           elements: [{
             type: "button",
-            text: { type: "plain_text", text: "🔗 Join Doxy.me Call", emoji: true },
+            text: { type: "plain_text", text: "🔗 Join Call", emoji: true },
             url: doxyUrl,
             style: "primary"
           }]
@@ -107,7 +109,7 @@ async function handleDoxyme(params) {
     }
   } catch (_) {}
 
-  // DM each mentioned user (fire and forget — we already ack'd)
+  // DM each mentioned user
   const sent = [];
   const failed = [];
 
@@ -115,19 +117,18 @@ async function handleDoxyme(params) {
     try {
       const dm = await slackAPI("conversations.open", { users: userId });
       if (!dm.ok) { failed.push(userId); continue; }
-
       await slackAPI("chat.postMessage", {
         channel: dm.channel.id,
         blocks: [
           {
             type: "section",
-            text: { type: "mrkdwn", text: `📹 *${callerName}* is inviting you to a Doxy.me call` }
+            text: { type: "mrkdwn", text: `📹 *${callerName}* is inviting you to a Doxy.me call\n${doxyUrl}` }
           },
           {
             type: "actions",
             elements: [{
               type: "button",
-              text: { type: "plain_text", text: "🔗 Join Doxy.me Call", emoji: true },
+              text: { type: "plain_text", text: "🔗 Join Call", emoji: true },
               url: doxyUrl,
               style: "primary"
             }]
@@ -143,26 +144,22 @@ async function handleDoxyme(params) {
 
   const sentList = sent.map(u => `<@${u}>`).join(", ");
   const failedList = failed.map(u => `<@${u}>`).join(", ");
-  let msg = sent.length ? `✅ Doxy.me call invite sent to ${sentList}` : "";
+  let msg = sent.length ? `✅ Invite sent to ${sentList}` : "";
   if (failed.length) msg += `\n⚠️ Couldn't DM: ${failedList}`;
-
   return { response_type: "ephemeral", text: msg || "No invites sent." };
 }
 
 module.exports = async (req, res) => {
-  // Handle GET (health check)
   if (req.method === "GET") {
     return res.status(200).json({ ok: true, app: "doxyme-slack-calling" });
   }
 
-  // Collect raw body
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks).toString("utf8");
-
   const contentType = req.headers["content-type"] || "";
 
-  // Handle JSON payloads (URL verification) — must respond before signature check
+  // URL verification (Slack sends this when saving Request URLs)
   if (contentType.includes("application/json")) {
     try {
       const body = JSON.parse(rawBody);
@@ -170,32 +167,25 @@ module.exports = async (req, res) => {
         return res.status(200).json({ challenge: body.challenge });
       }
     } catch (_) {}
-
-    // For other JSON payloads, verify signature
     if (!verifySlackSignature(req, rawBody)) {
       return res.status(401).json({ error: "Invalid signature" });
     }
     return res.status(200).json({ ok: true });
   }
 
-  // Verify signature for form-encoded payloads (slash commands)
+  // Slash commands
   if (!verifySlackSignature(req, rawBody)) {
     return res.status(401).json({ error: "Invalid signature" });
   }
 
-  // Handle form-encoded payloads (slash commands)
   const params = parseFormBody(rawBody);
 
-  // Immediately respond 200 to avoid timeout, then do work via response_url
-  if (params.command === "/doxy-setup" || params.command === "/doxyme") {
-    // Send immediate ack
-    res.status(200).json({ response_type: "ephemeral", text: "⏳ Working..." });
-
-    // Do the actual work and post result to response_url
+  if (params.command === "/doxyme") {
+    // Ack immediately
+    res.status(200).json({ response_type: "ephemeral", text: "⏳" });
+    
     try {
-      const handler = params.command === "/doxy-setup" ? handleDoxySetup : handleDoxyme;
-      const result = await handler(params);
-
+      const result = await handleDoxyme(params);
       if (params.response_url) {
         await fetch(params.response_url, {
           method: "POST",
@@ -204,15 +194,12 @@ module.exports = async (req, res) => {
         });
       }
     } catch (err) {
-      console.error("Handler error:", err);
+      console.error("Error:", err);
       if (params.response_url) {
         await fetch(params.response_url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            response_type: "ephemeral",
-            text: "Something went wrong. Please try again."
-          })
+          body: JSON.stringify({ response_type: "ephemeral", text: "Something went wrong." })
         });
       }
     }
