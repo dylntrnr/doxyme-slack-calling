@@ -1,5 +1,4 @@
 const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
-const { v4: uuidv4 } = require("uuid");
 const { getUser, setUser } = require("./db");
 const { normalizeDoxyUrl } = require("./doxy");
 
@@ -11,137 +10,6 @@ function requireEnv(name) {
   return value;
 }
 
-function extractUserId(event) {
-  return (
-    event.user_id ||
-    event.user ||
-    event.initiator ||
-    (event.call && (event.call.creator || event.call.user_id)) ||
-    null
-  );
-}
-
-function extractChannelId(event) {
-  return (
-    event.channel ||
-    event.channel_id ||
-    (event.call && (event.call.channel_id || event.call.channel)) ||
-    (Array.isArray(event.channels) ? event.channels[0] : null) ||
-    (event.call && Array.isArray(event.call.channels) ? event.call.channels[0] : null) ||
-    null
-  );
-}
-
-function isCallStartEvent(event) {
-  if (!event) return false;
-  if (event.type === "call_added" || event.type === "call_started") return true;
-  if (event.type === "call") {
-    return !event.subtype || event.subtype === "created" || event.subtype === "started";
-  }
-  return false;
-}
-
-function isCallEndEvent(event) {
-  if (!event) return false;
-  if (event.type === "call_ended") return true;
-  if (event.type === "call") {
-    return event.subtype === "ended" || event.subtype === "ended_by_user";
-  }
-  return false;
-}
-
-async function safePostEphemeral(client, channel, user, text) {
-  if (!channel || !user) return;
-  try {
-    await client.chat.postEphemeral({ channel, user, text });
-  } catch (err) {
-    console.error("Failed to post ephemeral message", err);
-  }
-}
-
-async function handleCallStart({ event, client, logger }) {
-  const userId = extractUserId(event);
-  const channelId = extractChannelId(event);
-
-  if (!userId) {
-    logger.error("Call start event missing user id", { event });
-    return;
-  }
-
-  const userRecord = await getUser(userId);
-  if (!userRecord || !userRecord.doxyUrl) {
-    await safePostEphemeral(
-      client,
-      channelId,
-      userId,
-      "Please run /doxy-setup with your Doxy.me room URL before starting a call."
-    );
-    return;
-  }
-
-  let displayName = "";
-  try {
-    const info = await client.users.info({ user: userId });
-    const profile = info.user && info.user.profile ? info.user.profile : {};
-    displayName = profile.display_name || profile.real_name || "";
-  } catch (err) {
-    logger.warn("Unable to fetch user info", { error: err });
-  }
-
-  const titleSuffix = displayName ? ` via ${displayName}` : "";
-  const title = `Doxy.me Call${titleSuffix}`;
-  const externalUniqueId = event.call_id || event.external_unique_id || uuidv4();
-
-  try {
-    const addResponse = await client.calls.add({
-      external_unique_id: externalUniqueId,
-      join_url: userRecord.doxyUrl,
-      desktop_app_join_url: userRecord.doxyUrl,
-      title
-    });
-
-    if (addResponse && addResponse.call && addResponse.call.id) {
-      try {
-        await client.calls.update({
-          id: addResponse.call.id,
-          join_url: userRecord.doxyUrl,
-          desktop_app_join_url: userRecord.doxyUrl,
-          title
-        });
-      } catch (err) {
-        logger.warn("calls.update failed", { error: err });
-      }
-    }
-  } catch (err) {
-    logger.error("calls.add failed", { error: err });
-    await safePostEphemeral(
-      client,
-      channelId,
-      userId,
-      "There was a problem starting your Doxy.me call. Please try again."
-    );
-  }
-}
-
-async function handleCallEnd({ event, client, logger }) {
-  const callId = event.call_id || event.id || (event.call && event.call.id) || null;
-  const externalUniqueId = event.external_unique_id || (event.call && event.call.external_unique_id) || null;
-
-  if (!callId && !externalUniqueId) {
-    logger.warn("Call end event missing identifiers", { event });
-    return;
-  }
-
-  try {
-    await client.calls.end({
-      id: callId,
-      external_unique_id: externalUniqueId
-    });
-  } catch (err) {
-    logger.warn("calls.end failed", { error: err });
-  }
-}
-
 function buildApp() {
   const signingSecret = requireEnv("SLACK_SIGNING_SECRET");
   const botToken = requireEnv("SLACK_BOT_TOKEN");
@@ -149,7 +17,7 @@ function buildApp() {
   const receiver = new ExpressReceiver({
     signingSecret,
     endpoints: "/api/slack",
-    processBeforeResponse: true
+    processBeforeResponse: false
   });
 
   const app = new App({
@@ -158,6 +26,7 @@ function buildApp() {
     logLevel: LogLevel.INFO
   });
 
+  // /doxy-setup <url> — save your doxy.me room link
   app.command("/doxy-setup", async ({ command, ack, respond, logger }) => {
     await ack();
 
@@ -165,7 +34,7 @@ function buildApp() {
     if (!normalized) {
       await respond({
         response_type: "ephemeral",
-        text: "Please provide a valid Doxy.me room URL, e.g. /doxy-setup https://doxy.me/yourroom."
+        text: "Please provide a valid Doxy.me room URL.\nUsage: `/doxy-setup https://doxy.me/yourroom`"
       });
       return;
     }
@@ -174,31 +43,135 @@ function buildApp() {
       await setUser(command.user_id, normalized);
       await respond({
         response_type: "ephemeral",
-        text: "✅ Your Doxy.me room has been linked. You can now use the phone icon to start calls."
+        text: `✅ Your Doxy.me room has been linked: ${normalized}\nUse \`/doxyme @someone\` to invite people to your room.`
       });
     } catch (err) {
       logger.error("Failed to store user mapping", { error: err });
       await respond({
         response_type: "ephemeral",
-        text: "Sorry, something went wrong saving your Doxy.me URL. Please try again."
+        text: "Something went wrong saving your URL. Please try again."
       });
     }
   });
 
-  const callHandler = async ({ event, client, logger }) => {
-    if (isCallEndEvent(event)) {
-      await handleCallEnd({ event, client, logger });
+  // /doxyme [@user ...] — DM mentioned users your doxy.me link
+  app.command("/doxyme", async ({ command, ack, client, respond, logger }) => {
+    await ack();
+
+    const callerId = command.user_id;
+    const userRecord = await getUser(callerId);
+
+    if (!userRecord || !userRecord.doxyUrl) {
+      await respond({
+        response_type: "ephemeral",
+        text: "You haven't set up your Doxy.me room yet.\nRun `/doxy-setup https://doxy.me/yourroom` first."
+      });
       return;
     }
-    if (isCallStartEvent(event)) {
-      await handleCallStart({ event, client, logger });
-    }
-  };
 
-  app.event("call", callHandler);
-  app.event("call_added", callHandler);
-  app.event("call_started", callHandler);
-  app.event("call_ended", callHandler);
+    const doxyUrl = userRecord.doxyUrl;
+
+    // Extract mentioned user IDs from Slack's escaped format: <@U12345> or <@U12345|name>
+    const mentionRegex = /<@(U[A-Z0-9]+)(?:\|[^>]*)?>/g;
+    const mentionedUsers = [];
+    let match;
+    while ((match = mentionRegex.exec(command.text)) !== null) {
+      mentionedUsers.push(match[1]);
+    }
+
+    // If no users mentioned, post the link in the channel
+    if (mentionedUsers.length === 0) {
+      await respond({
+        response_type: "in_channel",
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `📹 *<@${callerId}> is starting a Doxy.me call*`
+            }
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: { type: "plain_text", text: "🔗 Join Doxy.me Call", emoji: true },
+                url: doxyUrl,
+                style: "primary"
+              }
+            ]
+          }
+        ]
+      });
+      return;
+    }
+
+    // Get caller's display name
+    let callerName = "Someone";
+    try {
+      const info = await client.users.info({ user: callerId });
+      const profile = info.user && info.user.profile ? info.user.profile : {};
+      callerName = profile.display_name || profile.real_name || "Someone";
+    } catch (err) {
+      logger.warn("Unable to fetch caller info", { error: err });
+    }
+
+    // DM each mentioned user
+    const sent = [];
+    const failed = [];
+
+    for (const userId of mentionedUsers) {
+      try {
+        // Open a DM channel with the user
+        const dm = await client.conversations.open({ users: userId });
+        const channelId = dm.channel.id;
+
+        await client.chat.postMessage({
+          channel: channelId,
+          blocks: [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: `📹 *${callerName}* is inviting you to a Doxy.me call`
+              }
+            },
+            {
+              type: "actions",
+              elements: [
+                {
+                  type: "button",
+                  text: { type: "plain_text", text: "🔗 Join Doxy.me Call", emoji: true },
+                  url: doxyUrl,
+                  style: "primary"
+                }
+              ]
+            }
+          ],
+          text: `${callerName} is inviting you to a Doxy.me call: ${doxyUrl}`
+        });
+        sent.push(userId);
+      } catch (err) {
+        logger.error(`Failed to DM user ${userId}`, { error: err });
+        failed.push(userId);
+      }
+    }
+
+    // Also post in the channel where the command was run
+    const sentList = sent.map(u => `<@${u}>`).join(", ");
+    const failedList = failed.map(u => `<@${u}>`).join(", ");
+
+    let statusMsg = `✅ Doxy.me call invite sent to ${sentList}`;
+    if (failed.length > 0) {
+      statusMsg += `\n⚠️ Couldn't DM: ${failedList} (they may need to add the Doxy.me app first)`;
+    }
+
+    await respond({
+      response_type: "ephemeral",
+      text: statusMsg
+    });
+  });
 
   app.error((error) => {
     console.error("Slack app error", error);
