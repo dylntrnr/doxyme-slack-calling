@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/slack.js": {
+      "runtime": "nodejs20.x"
+    }
+  },
+  "routes": [
+    { "src": "/api/slack", "dest": "/api/slack.js" }
+  ]
+}

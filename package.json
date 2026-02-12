@@ -1,0 +1,19 @@
+{
+  "name": "doxyme-slack-calling",
+  "version": "1.0.0",
+  "description": "Doxy.me Slack Calling Integration",
+  "main": "api/slack.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node src/server.js",
+    "lint": "node --check api/slack.js",
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.19.0",
+    "uuid": "^9.0.1"
+  }
+}
